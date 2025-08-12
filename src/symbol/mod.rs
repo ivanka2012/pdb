@@ -221,6 +221,8 @@ pub enum SymbolData<'t> {
     Thunk(ThunkSymbol<'t>),
     /// A block of separated code.
     SeparatedCode(SeparatedCodeSymbol),
+    /// Extra frame and procedure information.
+    FrameProc(FrameProcSymbol)
 }
 
 impl<'t> SymbolData<'t> {
@@ -254,6 +256,7 @@ impl<'t> SymbolData<'t> {
             Self::RegisterRelative(data) => Some(data.name),
             Self::Thunk(data) => Some(data.name),
             Self::SeparatedCode(_) => None,
+            Self::FrameProc(_) => None,
         }
     }
 }
@@ -307,6 +310,7 @@ impl<'t> TryFromCtx<'t> for SymbolData<'t> {
             S_REGREL32 => SymbolData::RegisterRelative(buf.parse_with(kind)?),
             S_THUNK32 | S_THUNK32_ST => SymbolData::Thunk(buf.parse_with(kind)?),
             S_SEPCODE => SymbolData::SeparatedCode(buf.parse_with(kind)?),
+            S_FRAMEPROC => SymbolData::FrameProc(buf.parse_with(kind)?),
             other => return Err(Error::UnimplementedSymbolKind(other)),
         };
 
@@ -1493,6 +1497,193 @@ impl<'t> TryFromCtx<'t, SymbolKind> for SeparatedCodeSymbol {
                 offset: parent_offset,
                 section: parent_section,
             },
+        };
+
+        Ok((symbol, buf.pos()))
+    }
+}
+
+/// Encoded base pointer register
+/// You can find more information on this [LLVM ticket](https://reviews.llvm.org/D51894?id)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FrameEncodedBasePointerReg {
+    /// No register was used
+    NoRegister = 0,
+    /// On x86 this refers to ESP
+    StackPointer = 1,
+    /// On x86 this refers to EBP
+    FramePointer = 2,
+    /// Mystery register. On x86 and MSVC this refers to EBX, on LLVM this refers to ESI.
+    /// This is used if
+    Alternative = 3,
+}
+
+impl FrameEncodedBasePointerReg {
+    fn from_u32(value: u32) -> FrameEncodedBasePointerReg {
+        match value {
+            0 => Self::NoRegister,
+            1 => Self::StackPointer,
+            2 => Self::FramePointer,
+            3 => Self::Alternative,
+            _ => unreachable!()
+        }
+    }
+}
+
+// Flags for S_FRAMEPROC
+const CV_FRAMEPROCSYM_HAS_ALLOCA: u32 = 0x01; // 1 << 0
+const CV_FRAMEPROCSYM_HAS_SETJMP: u32 = 0x02; // 1 << 1
+const CV_FRAMEPROCSYM_HAS_LONGJMP: u32 = 0x04; // 1 << 2
+const CV_FRAMEPROCSYM_HAS_INLINE_ASM: u32 = 0x08; // 1 << 3
+const CV_FRAMEPROCSYM_HAS_EH_STATES: u32 = 0x10; // 1 << 4
+const CV_FRAMEPROCSYM_HAS_INLINE_SPECIFICATION: u32 = 0x20; // 1 << 5
+const CV_FRAMEPROCSYM_HAS_SEH: u32 = 0x40; // 1 << 6
+const CV_FRAMEPROCSYM_NAKED: u32 = 0x80; // 1 << 7
+const CV_FRAMEPROCSYM_GS: u32 = 0x100; // 1 << 8
+const CV_FRAMEPROCSYM_ASYNC_EH: u32 = 0x200; // 1 << 9
+const CV_FRAMEPROCSYM_GS_NO_STACK_ORDERING: u32 = 0x400; // 1 << 10
+const CV_FRAMEPROCSYM_WAS_INLINED: u32 = 0x800; // 1 << 11
+const CV_FRAMEPROCSYM_STRICT_GC_CHECK: u32 = 0x1000; // 1 << 12
+const CV_FRAMEPROCSYM_SAFEBUFFERS: u32 = 0x2000; // 1 << 13
+const CV_FRAMEPROCSYM_HAS_POGO: u32 = 0x40000; // 1 << 18
+const CV_FRAMEPROCSYM_HAS_VALID_POGO_COUNTS: u32 = 0x80000; // 1 << 19
+const CV_FRAMEPROCSYM_OPTIMIZED_FOR_SPEED: u32 = 0x100000; // 1 << 20
+const CV_FRAMEPROCSYM_GUARD_CF: u32 = 0x200000; // 1 << 21
+const CV_FRAMEPROCSYM_GUARD_CFW: u32 = 0x400000; // 1 << 22
+
+// Numeric bitfields for S_FRAMEPROC
+const CV_FRAMEPROCSYM_ENCODED_LOCAL_BASE_POINTER: u32 = 14; // as in "1 << 14"
+const CV_FRAMEPROCSYM_ENCODED_PARAM_BASE_POINTER: u32 = 16; // as in "1 << 16"
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Flags for [`FrameProcSymbol`]
+pub struct FrameProcFlags {
+    /// This function uses alloca()
+    pub has_alloca: bool,
+    /// This function uses setjmp()
+    pub has_setjmp: bool,
+    /// This function uses longjmp() 
+    pub has_longjmp: bool,
+    /// This function uses inline assembly.
+    pub has_inline_asm: bool,
+    /// This function has EH states.
+    pub has_eh_states: bool,
+    /// This function was specified with `inline`.
+    pub has_inline_specification: bool,
+    /// This function has Structured Exception Handling. 
+    pub has_seh: bool,
+    /// This function was specified with `__declspec(naked)`.
+    pub naked: bool,
+    /// This function was compiled with /GS (Buffer Security Check)
+    pub gs: bool,
+    /// This function was compiled with /EHa. 
+    pub async_eh: bool,
+    /// This function was compiled with /GS but the compiler was unable to reorder the stack.
+    pub gs_no_stack_ordering: bool,
+    /// This function was inlined within another function.
+    pub was_inlined: bool,
+    /// This function was specified with `__declspec(strict_gs_check)`
+    pub strict_gc_check: bool,
+    /// This function was specified with `__declspec(safebuffers)`
+    pub safebuffers: bool,
+    /// Which register is used for accessing locals.
+    /// See the [`FrameEncodedBasePointerReg`] for possible values.
+    pub local_base_pointer: FrameEncodedBasePointerReg,
+    /// Which register is used for accessing parameters.
+    /// See the [`FrameEncodedBasePointerReg`] for possible values.
+    pub param_base_pointer: FrameEncodedBasePointerReg,
+    /// This function was compiled with PGO / Pogo / Profile-Guided Optimization.
+    pub has_pogo: bool,
+    /// This function has valid PGO / Pogo counts.
+    pub has_valid_pogo_counts: bool,
+    /// This function was optimized for speed.
+    pub optimized_for_speed: bool,
+    /// This function has CFG (Control Flow Guard) checks and no write checks.
+    pub guard_cf: bool,
+    /// This function has CFW (Control Flow Write?) checks and/or instrumentation.
+    pub guard_cfw: bool,
+}
+
+impl<'t> TryFromCtx<'t, Endian> for FrameProcFlags {
+    type Error = scroll::Error;
+
+    fn try_from_ctx(this: &'t [u8], le: Endian) -> scroll::Result<(Self, usize)> {
+        let (value, size) = u32::try_from_ctx(this, le)?;
+
+        let flags = Self {
+            has_alloca: value & CV_FRAMEPROCSYM_HAS_ALLOCA != 0,
+            has_setjmp: value & CV_FRAMEPROCSYM_HAS_SETJMP != 0,
+            has_longjmp: value & CV_FRAMEPROCSYM_HAS_LONGJMP != 0,
+            has_inline_asm: value & CV_FRAMEPROCSYM_HAS_INLINE_ASM != 0,
+            has_eh_states: value & CV_FRAMEPROCSYM_HAS_EH_STATES != 0,
+            has_inline_specification: value & CV_FRAMEPROCSYM_HAS_INLINE_SPECIFICATION != 0,
+            has_seh: value & CV_FRAMEPROCSYM_HAS_SEH != 0,
+            naked: value & CV_FRAMEPROCSYM_NAKED != 0,
+            gs: value & CV_FRAMEPROCSYM_GS != 0,
+            async_eh: value & CV_FRAMEPROCSYM_ASYNC_EH != 0,
+            gs_no_stack_ordering: value & CV_FRAMEPROCSYM_GS_NO_STACK_ORDERING != 0,
+            was_inlined: value & CV_FRAMEPROCSYM_WAS_INLINED != 0,
+            strict_gc_check: value & CV_FRAMEPROCSYM_STRICT_GC_CHECK != 0,
+            safebuffers: value & CV_FRAMEPROCSYM_SAFEBUFFERS != 0,
+            local_base_pointer: FrameEncodedBasePointerReg::from_u32((value >> CV_FRAMEPROCSYM_ENCODED_LOCAL_BASE_POINTER) & 0b11),
+            param_base_pointer: FrameEncodedBasePointerReg::from_u32((value >> CV_FRAMEPROCSYM_ENCODED_PARAM_BASE_POINTER) & 0b11),
+            has_pogo: value & CV_FRAMEPROCSYM_HAS_POGO != 0,
+            has_valid_pogo_counts: value & CV_FRAMEPROCSYM_HAS_VALID_POGO_COUNTS != 0,
+            optimized_for_speed: value & CV_FRAMEPROCSYM_OPTIMIZED_FOR_SPEED != 0,
+            guard_cf: value & CV_FRAMEPROCSYM_GUARD_CF != 0,
+            guard_cfw: value & CV_FRAMEPROCSYM_GUARD_CFW != 0,
+        };
+
+        Ok((flags, size))
+    }
+}
+
+/// Extra frame and procedure information.
+/// This symbol follows up a [`ProcedureSymbol`] symbol and it is directly related to that procedure symbol.
+/// 
+/// Symbol kind `S_FRAMEPROC`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameProcSymbol {
+    /// Size of frame in bytes.
+    pub frame: u32,
+    /// Size of padding for the frame in bytes.
+    pub pad: u32,
+    /// Offset (relative to the frame pointer) to where padding starts.
+    pub pad_offset: u32, 
+    /// The total size of the callee saved registers.
+    pub callee_saved_registers: u32,
+    /// Exception handler for this frame.
+    pub exception_handler: PdbInternalSectionOffset,
+    /// Flags.
+    /// See [`FrameProcFlags`] for more information.
+    pub flags: FrameProcFlags,
+}
+
+impl<'t> TryFromCtx<'t, SymbolKind> for FrameProcSymbol {
+    type Error = Error;
+
+    fn try_from_ctx(this: &'t [u8], _: SymbolKind) -> Result<(Self, usize)> {
+        let mut buf = ParseBuffer::from(this);
+
+        let frame = buf.parse()?;
+        let pad = buf.parse()?;
+        let pad_offset = buf.parse()?;
+        let callee_saved_registers = buf.parse()?;
+        let exception_handler_offset = buf.parse()?;
+        let exception_handler_parent = buf.parse()?;
+        let flags = buf.parse()?;
+
+        let symbol = Self {
+            frame,
+            pad,
+            pad_offset,
+            callee_saved_registers,
+            exception_handler: PdbInternalSectionOffset { 
+                offset: exception_handler_offset, 
+                section: exception_handler_parent 
+            },
+            flags
         };
 
         Ok((symbol, buf.pos()))
