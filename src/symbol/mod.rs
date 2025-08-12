@@ -16,7 +16,7 @@ use crate::FallibleIterator;
 mod annotations;
 mod constants;
 
-use self::constants::*;
+pub use self::constants::*;
 pub use self::constants::{CPUType, SourceLanguage};
 
 pub use self::annotations::*;
